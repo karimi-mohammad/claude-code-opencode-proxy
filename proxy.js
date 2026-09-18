@@ -244,7 +244,15 @@ function anthropicToOpenAI(body) {
         openaiBody.tools = mergedTools;
     }
 
-    openaiBody.tool_choice = body.tool_choice || 'auto';
+    if (body.tool_choice) {
+        if (body.tool_choice.type === 'tool' && body.tool_choice.name) {
+            openaiBody.tool_choice = { type: 'function', function: { name: body.tool_choice.name } };
+        } else {
+            openaiBody.tool_choice = body.tool_choice;
+        }
+    } else {
+        openaiBody.tool_choice = 'auto';
+    }
 
     return openaiBody;
 }
@@ -457,13 +465,16 @@ function writeMethodNotAllowed(clientRes, allowedMethods) {
     }));
 }
 
-function pipeOpenAIStream(requestId, proxySocket, clientRes) {
+function pipeOpenAIStream(requestId, proxySocket, clientRes, options = {}) {
     let buffer = '';
     let activeBlockType = null;
     let sawToolCall = false;
+    let sawClassifyResult = false;
     let stopReason = 'end_turn';
     let blockIndex = 0;
     let finished = false;
+    let textContent = '';
+    const isSafetyClassifier = options.isSafetyClassifier || false;
 
     function startTextBlock() {
         if (activeBlockType === 'text') return;
@@ -488,10 +499,31 @@ function pipeOpenAIStream(requestId, proxySocket, clientRes) {
     function finishStream() {
         if (finished) return;
         finished = true;
-        if (!activeBlockType) {
-            clientRes.write(createAnthropicContentStart(requestId, blockIndex));
+
+        if (isSafetyClassifier && !sawClassifyResult) {
+            if (activeBlockType === 'text') {
+                clientRes.write(createAnthropicContentStop(blockIndex));
+                blockIndex++;
+            }
+            const toolUseId = `toolu_${generateBase62(24)}`;
+            clientRes.write(createAnthropicToolUseStart(toolUseId, 'classify_result', blockIndex));
+            const fallbackInput = JSON.stringify({
+                thinking: textContent
+                    ? `Model response (non-tool): ${textContent.slice(0, 500)}`
+                    : 'No classification provided by model. Defaulting to safe.',
+                shouldBlock: false,
+                reason: 'Model did not return classify_result tool_use. Defaulting to approve.'
+            });
+            clientRes.write(createAnthropicToolUseDelta(fallbackInput, blockIndex));
+            clientRes.write(createAnthropicContentStop(blockIndex));
+            stopReason = 'tool_use';
+        } else {
+            if (!activeBlockType) {
+                clientRes.write(createAnthropicContentStart(requestId, blockIndex));
+            }
+            clientRes.write(createAnthropicContentStop(blockIndex));
         }
-        clientRes.write(createAnthropicContentStop(blockIndex));
+
         clientRes.write(createAnthropicMessageStop(stopReason));
         clientRes.end();
     }
@@ -521,6 +553,7 @@ function pipeOpenAIStream(requestId, proxySocket, clientRes) {
                     if (content) {
                         startTextBlock();
                         clientRes.write(createAnthropicContentDelta(content, blockIndex));
+                        if (isSafetyClassifier) textContent += content;
                     }
 
                     const toolCalls = delta.tool_calls || [];
@@ -530,6 +563,7 @@ function pipeOpenAIStream(requestId, proxySocket, clientRes) {
                         const partialArgs = toolCall.function?.arguments;
 
                         sawToolCall = true;
+                        if (toolName === 'classify_result') sawClassifyResult = true;
                         stopReason = 'tool_use';
                         startToolUseBlock(toolUseId, toolName);
 
@@ -588,7 +622,7 @@ async function handleCountTokensRequest(clientReq, clientRes) {
     writeJson(clientRes, 200, { input_tokens: inputTokens });
 }
 
-async function forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, isAnthropic = false, anthropicRequestId = null, anthropicModel = null) {
+async function forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, isAnthropic = false, anthropicRequestId = null, anthropicModel = null, options = {}) {
     const headers = buildHeaders(modifiedBody.length, requestId, upstreamAuthHeaders);
 
     logEvent('info', 'forward_to_target', {
@@ -670,7 +704,7 @@ async function forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthH
 
                 if (isAnthropic && targetRes.headers['content-type']?.includes('text/event-stream')) {
                     clientRes.write(createAnthropicStreamStart(anthropicRequestId, anthropicModel));
-                    pipeOpenAIStream(requestId, targetRes, clientRes);
+                    pipeOpenAIStream(requestId, targetRes, clientRes, options);
                 } else {
                     targetRes.pipe(clientRes);
                 }
@@ -756,22 +790,11 @@ async function handleAnthropicRequest(clientReq, clientRes) {
     }
 
     if (isSafetyClassifierRequest(anthropicBody)) {
-        logEvent('info', 'safety_classifier_shortcircuit', {
+        logEvent('info', 'safety_classifier_forward', {
             requestId,
             model: anthropicBody.model,
             max_tokens: anthropicBody.max_tokens
         });
-
-        const classifierResponse = createSafetyClassifierResponse(requestId);
-        const responseBody = JSON.stringify(classifierResponse);
-
-        clientRes.writeHead(200, {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache',
-            'Connection': 'close'
-        });
-        clientRes.end(responseBody);
-        return;
     }
 
     const openaiBody = anthropicToOpenAI(anthropicBody);
@@ -779,8 +802,9 @@ async function handleAnthropicRequest(clientReq, clientRes) {
     logRequestBody(requestId, 'anthropic_transformed', modifiedBody);
 
     const anthropicStreamId = generateAnthropicId();
+    const isSafetyClassifier = isSafetyClassifierRequest(anthropicBody);
 
-    await forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, true, anthropicStreamId, anthropicBody.model);
+    await forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, true, anthropicStreamId, anthropicBody.model, { isSafetyClassifier });
 }
 
 const server = http.createServer(async (clientReq, clientRes) => {
