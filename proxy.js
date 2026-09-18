@@ -14,6 +14,7 @@ const LOG_FILE = path.join(LOG_DIR, 'proxy.log');
 
 const OPENAI_ENDPOINT = '/v1/chat/completions';
 const ANTHROPIC_ENDPOINT = '/v1/messages';
+const COUNT_TOKENS_ENDPOINT = '/v1/messages/count_tokens';
 const MODELS_ENDPOINT = '/v1/models';
 const HEALTH_ENDPOINT = '/health';
 
@@ -171,26 +172,80 @@ function anthropicToOpenAI(body) {
     }
 
     for (const msg of body.messages || []) {
-        if (msg.role === 'user' || msg.role === 'assistant') {
-            let content = '';
-            if (typeof msg.content === 'string') {
-                content = msg.content;
-            } else if (Array.isArray(msg.content)) {
-                content = msg.content
-                    .filter(b => b.type === 'text')
-                    .map(b => b.text)
-                    .join('\n');
+        if (msg.role === 'user' && Array.isArray(msg.content)) {
+            const hasToolResult = msg.content.some(b => b.type === 'tool_result');
+            if (hasToolResult) {
+                for (const block of msg.content) {
+                    if (block.type === 'tool_result') {
+                        messages.push({
+                            role: 'tool',
+                            tool_call_id: block.tool_use_id,
+                            content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
+                        });
+                    } else if (block.type === 'text' && block.text) {
+                        messages.push({ role: 'user', content: block.text });
+                    }
+                }
+            } else {
+                const textParts = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+                if (textParts) {
+                    messages.push({ role: 'user', content: textParts });
+                }
             }
-            messages.push({ role: msg.role, content });
+        } else if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+            const toolUseBlocks = msg.content.filter(b => b.type === 'tool_use');
+            const textBlocks = msg.content.filter(b => b.type === 'text');
+            if (toolUseBlocks.length) {
+                messages.push({
+                    role: 'assistant',
+                    content: textBlocks.map(b => b.text).join('\n') || null,
+                    tool_calls: toolUseBlocks.map(b => ({
+                        id: b.id,
+                        type: 'function',
+                        function: {
+                            name: b.name,
+                            arguments: typeof b.input === 'string' ? b.input : JSON.stringify(b.input)
+                        }
+                    }))
+                });
+            } else {
+                const text = textBlocks.map(b => b.text).join('\n');
+                messages.push({ role: 'assistant', content: text });
+            }
+        } else if (msg.role === 'assistant') {
+            messages.push({ role: 'assistant', content: msg.content || '' });
+        } else if (msg.role === 'user') {
+            messages.push({ role: 'user', content: msg.content || '' });
         }
     }
 
-    return {
+    const tools = Array.isArray(body.tools)
+        ? body.tools.map((tool) => ({
+            type: 'function',
+            function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.input_schema || { type: 'object', properties: {} }
+            }
+        }))
+        : undefined;
+
+    const openaiBody = {
         model: 'mimo-v2.5-free',
         messages,
         max_tokens: body.max_tokens || 4096,
         stream: true
     };
+
+    if (tools) {
+        openaiBody.tools = tools;
+    }
+
+    if (body.tool_choice) {
+        openaiBody.tool_choice = body.tool_choice;
+    }
+
+    return openaiBody;
 }
 
 function createAnthropicStreamStart(requestId, model) {
@@ -213,12 +268,12 @@ function createAnthropicStreamStart(requestId, model) {
     ].join('\n');
 }
 
-function createAnthropicContentStart(requestId) {
+function createAnthropicContentStart(requestId, index = 0) {
     return [
         `event: content_block_start`,
         `data: ${JSON.stringify({
             type: 'content_block_start',
-            index: 0,
+            index,
             content_block: { type: 'text', text: '' }
         })}`,
         '',
@@ -226,12 +281,12 @@ function createAnthropicContentStart(requestId) {
     ].join('\n');
 }
 
-function createAnthropicContentDelta(text) {
+function createAnthropicContentDelta(text, index = 0) {
     return [
         `event: content_block_delta`,
         `data: ${JSON.stringify({
             type: 'content_block_delta',
-            index: 0,
+            index,
             delta: { type: 'text_delta', text }
         })}`,
         '',
@@ -239,24 +294,24 @@ function createAnthropicContentDelta(text) {
     ].join('\n');
 }
 
-function createAnthropicContentStop() {
+function createAnthropicContentStop(index = 0) {
     return [
         `event: content_block_stop`,
         `data: ${JSON.stringify({
             type: 'content_block_stop',
-            index: 0
+            index
         })}`,
         '',
         ''
     ].join('\n');
 }
 
-function createAnthropicMessageStop(requestId) {
+function createAnthropicMessageStop(stopReason = 'end_turn') {
     return [
         `event: message_delta`,
         `data: ${JSON.stringify({
             type: 'message_delta',
-            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            delta: { stop_reason: stopReason, stop_sequence: null },
             usage: { output_tokens: 0 }
         })}`,
         '',
@@ -269,6 +324,38 @@ function createAnthropicMessageStop(requestId) {
         '',
         ''
     ].join('\n');
+}
+
+function createAnthropicToolUseStart(toolUseId, name, index) {
+    return [
+        `event: content_block_start`,
+        `data: ${JSON.stringify({
+            type: 'content_block_start',
+            index,
+            content_block: { type: 'tool_use', id: toolUseId, name, input: {} }
+        })}`,
+        '',
+        ''
+    ].join('\n');
+}
+
+function createAnthropicToolUseDelta(partialJson, index) {
+    return [
+        `event: content_block_delta`,
+        `data: ${JSON.stringify({
+            type: 'content_block_delta',
+            index,
+            delta: { type: 'input_json_delta', partial_json: partialJson }
+        })}`,
+        '',
+        ''
+    ].join('\n');
+}
+
+function mapFinishReason(finishReason) {
+    if (finishReason === 'tool_calls') return 'tool_use';
+    if (finishReason === 'length') return 'max_tokens';
+    return 'end_turn';
 }
 
 function injectTools(body) {
@@ -333,13 +420,47 @@ function writeMethodNotAllowed(clientRes, allowedMethods) {
     }));
 }
 
-function pipeOpenAIStream(proxySocket, clientRes) {
+function pipeOpenAIStream(requestId, proxySocket, clientRes) {
     let buffer = '';
-    let contentStarted = false;
+    let activeBlockType = null;
+    let sawToolCall = false;
+    let stopReason = 'end_turn';
+    let blockIndex = 0;
+    let finished = false;
+
+    function startTextBlock() {
+        if (activeBlockType === 'text') return;
+        if (activeBlockType) {
+            clientRes.write(createAnthropicContentStop(blockIndex));
+            blockIndex++;
+        }
+        clientRes.write(createAnthropicContentStart(requestId, blockIndex));
+        activeBlockType = 'text';
+    }
+
+    function startToolUseBlock(toolUseId, name) {
+        if (activeBlockType === 'tool_use') return;
+        if (activeBlockType) {
+            clientRes.write(createAnthropicContentStop(blockIndex));
+            blockIndex++;
+        }
+        clientRes.write(createAnthropicToolUseStart(toolUseId, name, blockIndex));
+        activeBlockType = 'tool_use';
+    }
+
+    function finishStream() {
+        if (finished) return;
+        finished = true;
+        if (!activeBlockType) {
+            clientRes.write(createAnthropicContentStart(requestId, blockIndex));
+        }
+        clientRes.write(createAnthropicContentStop(blockIndex));
+        clientRes.write(createAnthropicMessageStop(stopReason));
+        clientRes.end();
+    }
 
     proxySocket.on('data', (chunk) => {
         buffer += chunk.toString();
-
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
@@ -347,23 +468,37 @@ function pipeOpenAIStream(proxySocket, clientRes) {
             if (line.startsWith('data: ')) {
                 const data = line.slice(6).trim();
                 if (data === '[DONE]') {
-                    if (!contentStarted) {
-                        clientRes.write(createAnthropicContentStart());
-                    }
-                    clientRes.write(createAnthropicContentStop());
-                    clientRes.write(createAnthropicMessageStop());
-                    clientRes.end();
+                    finishStream();
                     return;
                 }
                 try {
                     const parsed = JSON.parse(data);
-                    const content = parsed.choices?.[0]?.delta?.content;
+                    const choice = parsed.choices?.[0] || {};
+                    const delta = choice.delta || {};
+
+                    if (choice.finish_reason) {
+                        stopReason = mapFinishReason(choice.finish_reason);
+                    }
+
+                    const content = delta.content;
                     if (content) {
-                        if (!contentStarted) {
-                            clientRes.write(createAnthropicContentStart());
-                            contentStarted = true;
+                        startTextBlock();
+                        clientRes.write(createAnthropicContentDelta(content, blockIndex));
+                    }
+
+                    const toolCalls = delta.tool_calls || [];
+                    for (const toolCall of toolCalls) {
+                        const toolUseId = toolCall.id || `toolu_${generateBase62(24)}`;
+                        const toolName = toolCall.function?.name || 'tool';
+                        const partialArgs = toolCall.function?.arguments;
+
+                        sawToolCall = true;
+                        stopReason = 'tool_use';
+                        startToolUseBlock(toolUseId, toolName);
+
+                        if (partialArgs) {
+                            clientRes.write(createAnthropicToolUseDelta(partialArgs, blockIndex));
                         }
-                        clientRes.write(createAnthropicContentDelta(content));
                     }
                 } catch { }
             }
@@ -371,17 +506,49 @@ function pipeOpenAIStream(proxySocket, clientRes) {
     });
 
     proxySocket.on('end', () => {
-        if (!contentStarted) {
-            clientRes.write(createAnthropicContentStart());
+        if (sawToolCall && stopReason === 'end_turn') {
+            stopReason = 'tool_use';
         }
-        clientRes.write(createAnthropicContentStop());
-        clientRes.write(createAnthropicMessageStop());
-        clientRes.end();
+        finishStream();
     });
 }
 
 function pipeOpenAIStreamToOpenAI(proxySocket, clientRes) {
     proxySocket.pipe(clientRes);
+}
+
+function estimateTokenCount(value) {
+    if (value == null) return 0;
+    if (typeof value === 'string') return Math.max(1, Math.ceil(value.length / 4));
+    if (Array.isArray(value)) return value.reduce((total, item) => total + estimateTokenCount(item), 0);
+    if (typeof value === 'object') return Object.values(value).reduce((total, item) => total + estimateTokenCount(item), 0);
+    return Math.max(1, Math.ceil(String(value).length / 4));
+}
+
+function countAnthropicTokens(body) {
+    let total = 0;
+    if (body.system) total += estimateTokenCount(body.system);
+    if (body.messages) total += estimateTokenCount(body.messages);
+    if (body.tools) total += estimateTokenCount(body.tools);
+    if (body.context) total += estimateTokenCount(body.context);
+    return Math.max(1, total);
+}
+
+async function handleCountTokensRequest(clientReq, clientRes) {
+    const requestId = generateRequestId();
+    const bodyBuffer = await collectBody(clientReq);
+
+    let body;
+    try {
+        body = JSON.parse(bodyBuffer.toString() || '{}');
+    } catch {
+        clientRes.writeHead(400);
+        clientRes.end('Invalid JSON');
+        return;
+    }
+
+    const inputTokens = countAnthropicTokens(body);
+    writeJson(clientRes, 200, { input_tokens: inputTokens });
 }
 
 async function forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, isAnthropic = false, anthropicRequestId = null, anthropicModel = null) {
@@ -466,8 +633,7 @@ async function forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthH
 
                 if (isAnthropic && targetRes.headers['content-type']?.includes('text/event-stream')) {
                     clientRes.write(createAnthropicStreamStart(anthropicRequestId, anthropicModel));
-                    clientRes.write(createAnthropicContentStart(anthropicRequestId));
-                    pipeOpenAIStream(targetRes, clientRes);
+                    pipeOpenAIStream(requestId, targetRes, clientRes);
                 } else {
                     targetRes.pipe(clientRes);
                 }
@@ -565,6 +731,10 @@ const server = http.createServer(async (clientReq, clientRes) => {
                 { id: 'claude-3-5-haiku', object: 'model', owned_by: 'anthropic' }
             ]
         });
+    }
+
+    if (clientReq.method === 'POST' && pathname === COUNT_TOKENS_ENDPOINT) {
+        return handleCountTokensRequest(clientReq, clientRes);
     }
 
     if (pathname === OPENAI_ENDPOINT || pathname === ANTHROPIC_ENDPOINT) {
