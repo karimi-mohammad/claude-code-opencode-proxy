@@ -670,7 +670,7 @@ async function handleOpenAIRequest(clientReq, clientRes) {
     const originalBody = await collectBody(clientReq);
     logRequestBody(requestId, 'openai_original', originalBody);
 
-    const modifiedBody = injectTools(originalBody);
+    const modifiedBody = originalBody;
     logRequestBody(requestId, 'openai_modified', modifiedBody);
 
     await forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, false);
@@ -700,7 +700,7 @@ async function handleAnthropicRequest(clientReq, clientRes) {
     }
 
     const openaiBody = anthropicToOpenAI(anthropicBody);
-    const modifiedBody = injectTools(Buffer.from(JSON.stringify(openaiBody)));
+    const modifiedBody = Buffer.from(JSON.stringify(openaiBody));
     logRequestBody(requestId, 'anthropic_transformed', modifiedBody);
 
     const anthropicStreamId = generateAnthropicId();
