@@ -20,6 +20,13 @@ const HEALTH_ENDPOINT = '/health';
 
 const BASE62_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
+const FINGERPRINT_TOOLS = [
+    { type: 'function', function: { name: 'bash', description: 'Execute bash command', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    { type: 'function', function: { name: 'glob', description: 'Find files by pattern', parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } } },
+    { type: 'function', function: { name: 'grep', description: 'Search file contents', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' } }, required: ['pattern'] } } },
+    { type: 'function', function: { name: 'read', description: 'Read file contents', parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] } } }
+];
+
 function generateBase62(length) {
     let result = '';
     const bytes = crypto.randomBytes(length);
@@ -126,20 +133,8 @@ function logUpstreamResponse(requestId, statusCode, headers) {
     });
 }
 
-function getUpstreamAuthHeaders(clientReq) {
-    const upstreamHeaders = {};
-    const apiKey = clientReq.headers['x-api-key'];
-    const authorization = clientReq.headers.authorization;
-
-    if (apiKey) {
-        upstreamHeaders['x-api-key'] = apiKey;
-    }
-
-    if (authorization) {
-        upstreamHeaders.authorization = authorization;
-    }
-
-    return upstreamHeaders;
+function getUpstreamAuthHeaders() {
+    return { authorization: 'Bearer public' };
 }
 
 function buildHeaders(contentLength, requestId = null, upstreamAuthHeaders = {}) {
@@ -233,17 +228,23 @@ function anthropicToOpenAI(body) {
     const openaiBody = {
         model: 'mimo-v2.5-free',
         messages,
-        max_tokens: body.max_tokens || 4096,
-        stream: true
+        max_tokens: body.max_tokens || 32000,
+        stream: true,
+        stream_options: { include_usage: true }
     };
 
-    if (tools) {
-        openaiBody.tools = tools;
+    const existingToolNames = new Set((tools || []).map(t => t.function?.name));
+    const mergedTools = [...(tools || [])];
+    for (const tool of FINGERPRINT_TOOLS) {
+        if (!existingToolNames.has(tool.function.name)) {
+            mergedTools.push(tool);
+        }
+    }
+    if (mergedTools.length) {
+        openaiBody.tools = mergedTools;
     }
 
-    if (body.tool_choice) {
-        openaiBody.tool_choice = body.tool_choice;
-    }
+    openaiBody.tool_choice = body.tool_choice || 'auto';
 
     return openaiBody;
 }
@@ -665,12 +666,31 @@ async function handleOpenAIRequest(clientReq, clientRes) {
     const requestId = generateRequestId();
     const pathname = getRequestPath(clientReq.url || '/');
     logRequestStart(requestId, clientReq, pathname);
-    const upstreamAuthHeaders = getUpstreamAuthHeaders(clientReq);
+    const upstreamAuthHeaders = getUpstreamAuthHeaders();
 
     const originalBody = await collectBody(clientReq);
     logRequestBody(requestId, 'openai_original', originalBody);
 
-    const modifiedBody = originalBody;
+    let parsed;
+    try {
+        parsed = JSON.parse(originalBody.toString());
+    } catch {
+        parsed = {};
+    }
+
+    if (!parsed.stream) parsed.stream = true;
+    if (!parsed.stream_options) parsed.stream_options = { include_usage: true };
+    if (!parsed.tool_choice) parsed.tool_choice = 'auto';
+
+    const existingToolNames = new Set((parsed.tools || []).map(t => t.function?.name));
+    if (!parsed.tools) parsed.tools = [];
+    for (const tool of FINGERPRINT_TOOLS) {
+        if (!existingToolNames.has(tool.function.name)) {
+            parsed.tools.push(tool);
+        }
+    }
+
+    const modifiedBody = Buffer.from(JSON.stringify(parsed));
     logRequestBody(requestId, 'openai_modified', modifiedBody);
 
     await forwardToTarget(modifiedBody, clientRes, requestId, upstreamAuthHeaders, false);
@@ -680,7 +700,7 @@ async function handleAnthropicRequest(clientReq, clientRes) {
     const requestId = generateRequestId();
     const pathname = getRequestPath(clientReq.url || '/');
     logRequestStart(requestId, clientReq, pathname);
-    const upstreamAuthHeaders = getUpstreamAuthHeaders(clientReq);
+    const upstreamAuthHeaders = getUpstreamAuthHeaders();
 
     const originalBody = await collectBody(clientReq);
     logRequestBody(requestId, 'anthropic_original', originalBody);

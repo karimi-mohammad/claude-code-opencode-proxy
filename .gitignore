@@ -3,6 +3,7 @@ logs/
 .env
 .env.*
 *.log
+.AI/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
