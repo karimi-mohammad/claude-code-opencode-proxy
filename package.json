@@ -1,5 +1,5 @@
 {
-  "name": "api-proxy",
+  "name": "claude-code-opencode-proxy",
   "version": "1.0.0",
   "description": "Local proxy that adapts Claude Code requests to opencode.ai",
   "main": "proxy.js",

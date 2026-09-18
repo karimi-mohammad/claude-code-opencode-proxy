@@ -1,4 +1,4 @@
-# api-proxy
+# claude-code-opencode-proxy
 
 Local HTTP proxy that accepts Claude Code-style Anthropic requests and forwards them to `opencode.ai` after rewriting the payload and headers.
 
