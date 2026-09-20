@@ -766,6 +766,7 @@ async function handleOpenAIRequest(clientReq, clientRes) {
         parsed = {};
     }
 
+    parsed.model = 'mimo-v2.5-free';
     if (!parsed.stream) parsed.stream = true;
     if (!parsed.stream_options) parsed.stream_options = { include_usage: true };
     if (!parsed.tool_choice) parsed.tool_choice = 'auto';
