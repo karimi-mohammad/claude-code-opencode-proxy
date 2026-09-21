@@ -4,6 +4,8 @@ logs/
 .env.*
 *.log
 .AI/
+*.har
+analyze_logs.js
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
